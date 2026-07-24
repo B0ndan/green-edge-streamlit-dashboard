@@ -18,7 +18,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 # ⚙️ 1. PAGE CONFIGURATION
 # ==========================================
 st.set_page_config(
-    page_title="Sustained Remote Telemetry Dashboard",
+    page_title="Sustained Remote Telemetry Dashboard for GREEN-EDGE",
     page_icon="📡",
     layout="wide"
 )
@@ -26,7 +26,7 @@ st.set_page_config(
 # ==========================================
 # 🔐 2. TTN CONFIGURATION & SECRETS
 # ==========================================
-# Reads secrets from Streamlit Cloud Secrets (or fallback to local test values)
+# Reads secrets from Streamlit Cloud Secrets (or fallback to local default values)
 THE_THINGS_NETWORK_SERVER = st.secrets.get("TTN_SERVER", "au1.cloud.thethings.network")
 APPLICATION_ID = st.secrets.get("TTN_APP_ID", "transmission-using-ttgo-new")
 API_KEY = st.secrets.get("TTN_API_KEY", "YOUR_NEW_REGENERATED_API_KEY")
@@ -40,9 +40,12 @@ STREAMLIT_LIVE_IMAGE = os.path.join(TARGET_FOLDER, "RARoom_live_progressive.jpg"
 STREAMLIT_TEMP_IMAGE = os.path.join(TARGET_FOLDER, "RARoom_live_progressive.tmp")
 FEED_FILE = "live_feed.json"
 
-# Global memory states for MQTT receiver
-current_target_label = "Unknown Spontaneous Matrix"
-current_target_confidence = "100%"
+# Global state tracking for MQTT receiver
+chunks = {}
+current_target_label = "Standby Status"
+current_target_confidence = "0%"
+current_total = 0
+last_packet_timestamp = 0
 
 if os.path.exists(PROGRESS_FILE):
     try:
@@ -50,11 +53,9 @@ if os.path.exists(PROGRESS_FILE):
             chunks = pickle.load(f)
     except Exception:
         chunks = {}
-else:
-    chunks = {}
 
 # ==========================================
-# 📡 3. MQTT RECEIVER LOGIC & HELPER FUNCTIONS
+# 📡 3. HELPER FUNCTIONS & MQTT LOGIC
 # ==========================================
 def load_existing_dashboard_data():
     if os.path.exists(FEED_FILE):
@@ -132,6 +133,29 @@ def save_progressive_preview(chunks_dict, total):
     if os.path.exists(STREAMLIT_TEMP_IMAGE):
         os.replace(STREAMLIT_TEMP_IMAGE, STREAMLIT_LIVE_IMAGE)
 
+def archive_current_image(label="UNKNOWN", is_complete=True):
+    """Saves live canvas to historical archive folder."""
+    if not os.path.exists(STREAMLIT_LIVE_IMAGE):
+        return None
+    
+    if os.path.getsize(STREAMLIT_LIVE_IMAGE) < 400:
+        return None
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    clean_label = label.replace(' ', '_').replace('/', '_').replace(':', '')
+    status_suffix = "" if is_complete else "_partial"
+    archive_filename = f"reconstructed_{timestamp}_{clean_label}{status_suffix}.jpg"
+    final_archive_path = os.path.join(TARGET_FOLDER, archive_filename)
+
+    try:
+        with open(STREAMLIT_LIVE_IMAGE, "rb") as src, open(final_archive_path, "wb") as dst:
+            dst.write(src.read())
+        print(f"🎉 Archive Saved: {final_archive_path}")
+        return final_archive_path
+    except Exception as e:
+        print(f"Error archiving image: {e}")
+        return None
+
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         print("✅ Connected to TTN Broker!")
@@ -141,7 +165,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
         print(f"❌ Connection failed: {rc}")
 
 def on_message(client, userdata, msg):
-    global chunks, current_target_label, current_target_confidence
+    global chunks, current_target_label, current_target_confidence, current_total, last_packet_timestamp
     try:
         payload = json.loads(msg.payload.decode('utf-8'))
         uplink_message = payload.get("uplink_message")
@@ -153,9 +177,24 @@ def on_message(client, userdata, msg):
         raw_bytes = base64.b64decode(frm_payload)
         if len(raw_bytes) == 0: return
 
+        now = time.time()
+
         # --- 🎯 1. IMMEDIATE TEXT METADATA LAYER ---
         if b"TEXT:" in raw_bytes:
             try:
+                # Archive previous image if it was partially received
+                if len(chunks) > 0:
+                    arch_path = archive_current_image(current_target_label, is_complete=False)
+                    if arch_path:
+                        update_dashboard_json(
+                            target=current_target_label,
+                            confidence=current_target_confidence,
+                            chunks_num=len(chunks),
+                            total_num=current_total if current_total > 0 else 1,
+                            trigger_type="Idle",
+                            final_archive_path=arch_path
+                        )
+
                 text_data = raw_bytes.decode('utf-8', errors='ignore').strip()
                 ai_result = text_data.replace("TEXT:", "")
                 
@@ -172,13 +211,15 @@ def on_message(client, userdata, msg):
 
                 # Reset image buffer
                 chunks = {}
+                current_total = 0
+                last_packet_timestamp = now
+
                 if os.path.exists(PROGRESS_FILE):
-                    os.remove(PROGRESS_FILE)
+                    try: os.remove(PROGRESS_FILE)
+                    except OSError: pass
                 if os.path.exists(STREAMLIT_LIVE_IMAGE):
-                    try:
-                        os.remove(STREAMLIT_LIVE_IMAGE)
-                    except OSError:
-                        pass
+                    try: os.remove(STREAMLIT_LIVE_IMAGE)
+                    except OSError: pass
 
                 update_dashboard_json(
                     target=current_target_label,
@@ -198,24 +239,29 @@ def on_message(client, userdata, msg):
         chunk_id, total = struct.unpack('>HH', raw_bytes[:4])
         img_payload = raw_bytes[4:]
 
-        # 🚨 CRITICAL FIX 1: New Image Detection
-        # If chunk_id is 0, a NEW image transfer is beginning! Wipe previous memory immediately.
-        if chunk_id == 0:
+        # --- 🧠 SMART TRANSMISSION SESSION DETECTION ---
+        time_gap = now - last_packet_timestamp if last_packet_timestamp > 0 else 0
+        total_changed = (current_total > 0 and total != current_total)
+
+        if (time_gap > 90 or total_changed) and len(chunks) > 0:
+            arch_path = archive_current_image(current_target_label, is_complete=(len(chunks) == current_total))
             chunks = {}
             if os.path.exists(PROGRESS_FILE):
-                os.remove(PROGRESS_FILE)
+                try: os.remove(PROGRESS_FILE)
+                except OSError: pass
             
-            # Wipe old plot chart latency data for the new stream
             data = load_existing_dashboard_data()
             data["packet_timestamps"] = []
             with open(FEED_FILE, "w") as f:
                 json.dump(data, f, indent=4)
 
-        # 🚨 CRITICAL FIX 2: Prevent index overflow
-        if chunk_id >= total:
-            return  # Ignore malformed/corrupted packet IDs
+        current_total = total
+        last_packet_timestamp = now
 
-        if chunk_id not in chunks:
+        # Prevent chunk contamination across different image sizes
+        chunks = {k: v for k, v in chunks.items() if k < total}
+
+        if chunk_id < total:
             chunks[chunk_id] = img_payload
             
             with open(PROGRESS_FILE, 'wb') as f:
@@ -233,28 +279,26 @@ def on_message(client, userdata, msg):
             
             # --- 🎉 3. IMAGE COMPLETION ARCHIVE ---
             if len(chunks) == total:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                clean_label = current_target_label.replace(' ', '_').replace('/', '_')
-                archive_filename = f"reconstructed_{timestamp}_{clean_label}.jpg"
-                final_archive_path = os.path.join(TARGET_FOLDER, archive_filename)
+                final_archive_path = archive_current_image(current_target_label, is_complete=True)
                 
-                if os.path.exists(STREAMLIT_LIVE_IMAGE):
-                    with open(STREAMLIT_LIVE_IMAGE, "rb") as src, open(final_archive_path, "wb") as dst:
-                        dst.write(src.read())
-                
-                print(f"🎉 Complete Image Archive Saved: {final_archive_path}")
-                
+                # Auto-log event if TEXT header packet was missed over LoRaWAN
+                data = load_existing_dashboard_data()
+                history = data.get("history", [])
+                if not history or history[0].get("target") != current_target_label:
+                    log_classification_to_history(current_target_label, current_target_confidence, "Primary Target")
+
                 update_dashboard_json(
                     target=current_target_label,
                     confidence=current_target_confidence,
                     chunks_num=total,
                     total_num=total,
                     trigger_type="Idle",
-                    final_archive_path=final_archive_path
+                    final_archive_path=final_archive_path if final_archive_path else ""
                 )
                  
                 if os.path.exists(PROGRESS_FILE):
-                    os.remove(PROGRESS_FILE)  
+                    try: os.remove(PROGRESS_FILE)
+                    except OSError: pass
                 chunks = {}
     
     except Exception as e:
@@ -280,7 +324,7 @@ def start_ttn_mqtt_listener():
     thread.start()
     return thread
 
-# Initialize background listener
+# Run background MQTT listener
 start_ttn_mqtt_listener()
 
 # ==========================================
@@ -355,6 +399,7 @@ total_cx = max(1, data.get("total_chunks", 1))
 history = data.get("history", [])
 packet_timestamps = data.get("packet_timestamps", [])
 
+# Banner Status Logic
 if "Primary" in sys_type or chunks_rx > 0:
     st.markdown(f"""
         <div class="metric-alert">
