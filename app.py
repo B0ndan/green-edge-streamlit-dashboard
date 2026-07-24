@@ -153,6 +153,7 @@ def on_message(client, userdata, msg):
         raw_bytes = base64.b64decode(frm_payload)
         if len(raw_bytes) == 0: return
 
+        # --- 🎯 1. IMMEDIATE TEXT METADATA LAYER ---
         if b"TEXT:" in raw_bytes:
             try:
                 text_data = raw_bytes.decode('utf-8', errors='ignore').strip()
@@ -169,6 +170,7 @@ def on_message(client, userdata, msg):
                 
                 log_classification_to_history(current_target_label, current_target_confidence, trigger_label)
 
+                # Reset image buffer
                 chunks = {}
                 if os.path.exists(PROGRESS_FILE):
                     os.remove(PROGRESS_FILE)
@@ -190,13 +192,28 @@ def on_message(client, userdata, msg):
                 print(f"Failed parsing instant text metadata: {e}")
                 return
 
+        # --- 🖼️ 2. IMAGE PACKET PROCESSING ---
         if len(raw_bytes) < 4: return
 
         chunk_id, total = struct.unpack('>HH', raw_bytes[:4])
         img_payload = raw_bytes[4:]
 
-        if len(chunks) > 0 and chunk_id >= total:
+        # 🚨 CRITICAL FIX 1: New Image Detection
+        # If chunk_id is 0, a NEW image transfer is beginning! Wipe previous memory immediately.
+        if chunk_id == 0:
             chunks = {}
+            if os.path.exists(PROGRESS_FILE):
+                os.remove(PROGRESS_FILE)
+            
+            # Wipe old plot chart latency data for the new stream
+            data = load_existing_dashboard_data()
+            data["packet_timestamps"] = []
+            with open(FEED_FILE, "w") as f:
+                json.dump(data, f, indent=4)
+
+        # 🚨 CRITICAL FIX 2: Prevent index overflow
+        if chunk_id >= total:
+            return  # Ignore malformed/corrupted packet IDs
 
         if chunk_id not in chunks:
             chunks[chunk_id] = img_payload
@@ -214,14 +231,18 @@ def on_message(client, userdata, msg):
                 trigger_type="Primary Packet Stream"
             )
             
+            # --- 🎉 3. IMAGE COMPLETION ARCHIVE ---
             if len(chunks) == total:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                archive_filename = f"reconstructed_{timestamp}_{current_target_label.replace(' ', '_')}.jpg"
+                clean_label = current_target_label.replace(' ', '_').replace('/', '_')
+                archive_filename = f"reconstructed_{timestamp}_{clean_label}.jpg"
                 final_archive_path = os.path.join(TARGET_FOLDER, archive_filename)
                 
                 if os.path.exists(STREAMLIT_LIVE_IMAGE):
                     with open(STREAMLIT_LIVE_IMAGE, "rb") as src, open(final_archive_path, "wb") as dst:
                         dst.write(src.read())
+                
+                print(f"🎉 Complete Image Archive Saved: {final_archive_path}")
                 
                 update_dashboard_json(
                     target=current_target_label,
