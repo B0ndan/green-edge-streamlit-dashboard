@@ -1,5 +1,6 @@
-streamlit
-pandas
-pillow
-plotly
-paho-mqtt
+streamlit>=1.37,<2
+pandas>=2.0,<3
+pillow>=10,<13
+requests>=2.31,<3
+plotly>=5.20,<7
+streamlit-autorefresh>=1.0.1,<2
