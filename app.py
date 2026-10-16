@@ -619,6 +619,6 @@ with tab_system:
     })
 
 st.markdown(
-    f"<div class='footer'>© {datetime.now().year} Green Edge Project · Developed by Muhammad Bondan Vitto Ramadhan · {t('footer')}<br>Wildlife photographs remain subject to their credited source licences.</div>",
+    f"<div class='footer'>© {datetime.now().year} Green Edge Project · Developed by Bondan · {t('footer')}<br>Wildlife photographs remain subject to their credited source licences.</div>",
     unsafe_allow_html=True,
 )
