@@ -11,13 +11,14 @@ import json
 import os
 import re
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import requests
 import streamlit as st
-from PIL import ImageFile
+from PIL import Image, ImageFile
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -332,6 +333,57 @@ def image_bytes(path: str | Path) -> bytes | None:
     return None
 
 
+def stable_feed(path: Path) -> dict[str, Any]:
+    """Keep the last complete feed while the receiver replaces the JSON file."""
+    latest = read_feed(path)
+    if latest:
+        st.session_state["last_valid_feed"] = latest
+    return st.session_state.get("last_valid_feed", latest)
+
+
+def stable_image(path: str | Path, cache_key: str) -> bytes | None:
+    """Return the newest decodable image, otherwise retain the prior frame."""
+    payload = image_bytes(path)
+    if payload:
+        try:
+            with Image.open(BytesIO(payload)) as image:
+                image.load()
+            st.session_state[cache_key] = payload
+        except (OSError, SyntaxError, ValueError):
+            pass
+    return st.session_state.get(cache_key)
+
+
+def feed_snapshot() -> dict[str, Any]:
+    """Normalize the changing receiver state for each independently refreshed panel."""
+    data = stable_feed(FEED_FILE)
+    target = str(data.get("target", "Standby Status")).strip()
+    confidence_raw = data.get("confidence", "0%")
+    confidence_num = parse_confidence(confidence_raw)
+    confidence_text = f"{confidence_num:.1%}" if confidence_num is not None else str(confidence_raw)
+    event_type = str(data.get("type", "Idle"))
+    chunks_received = max(0, int(data.get("chunks_received", 0) or 0))
+    total_chunks = max(1, int(data.get("total_chunks", 1) or 1))
+    feed_age = None
+    try:
+        if FEED_FILE.exists():
+            feed_age = max(0.0, datetime.now(timezone.utc).timestamp() - FEED_FILE.stat().st_mtime)
+    except OSError:
+        pass
+    return {
+        "data": data,
+        "target": target,
+        "confidence_text": confidence_text,
+        "event_type": event_type,
+        "chunks_received": chunks_received,
+        "total_chunks": total_chunks,
+        "progress": min(1.0, chunks_received / total_chunks),
+        "history": normalize_history(data.get("history", [])),
+        "packets": packet_frame(data.get("packet_timestamps", [])),
+        "feed_age": feed_age,
+    }
+
+
 def parse_confidence(value: Any) -> float | None:
     try:
         if isinstance(value, str):
@@ -417,91 +469,92 @@ def normalize_history(raw: Any) -> pd.DataFrame:
     return frame
 
 
+if "language" not in st.session_state:
+    st.session_state["language"] = "en"
+
 with st.sidebar:
-    language_name = st.selectbox(t("language"), list(LANGUAGES), index=0)
+    current_name = next(name for name, code in LANGUAGES.items() if code == st.session_state["language"])
+    language_name = st.selectbox(t("language"), list(LANGUAGES), index=list(LANGUAGES).index(current_name))
     st.session_state["language"] = LANGUAGES[language_name]
     refresh_seconds = st.select_slider(t("refresh"), options=[2, 5, 10, 30], value=5, format_func=lambda x: f"{x}s")
+    if st.button("↻ Refresh now", width="stretch"):
+        st.rerun()
     if st.session_state["language"] == "gor":
         st.caption("⚠️ " + t("localization_note"))
     st.markdown("---")
     st.caption(f"Feed: `{FEED_FILE}`")
     st.caption(f"Images: `{IMAGE_FOLDER}`")
 
-try:
-    from streamlit_autorefresh import st_autorefresh
-
-    st_autorefresh(interval=refresh_seconds * 1000, key="green_edge_refresh")
-except ImportError:
-    st.sidebar.button("↻ Refresh")
-
-data = read_feed(FEED_FILE)
-target = str(data.get("target", "Standby Status")).strip()
-confidence_raw = data.get("confidence", "0%")
-confidence_num = parse_confidence(confidence_raw)
-confidence_text = f"{confidence_num:.1%}" if confidence_num is not None else str(confidence_raw)
-event_type = str(data.get("type", "Idle"))
-chunks_received = max(0, int(data.get("chunks_received", 0) or 0))
-total_chunks = max(1, int(data.get("total_chunks", 1) or 1))
-progress = min(1.0, chunks_received / total_chunks)
-history_df = normalize_history(data.get("history", []))
-packets_df = packet_frame(data.get("packet_timestamps", []))
-
-feed_age = None
-if FEED_FILE.exists():
-    feed_age = max(0.0, datetime.now(timezone.utc).timestamp() - FEED_FILE.stat().st_mtime)
-receiver_status = t("online") if feed_age is not None and feed_age <= 15 else t("delayed") if feed_age is not None and feed_age <= 60 else t("offline")
-receiver_icon = "🟢" if feed_age is not None and feed_age <= 15 else "🟠" if feed_age is not None and feed_age <= 60 else "🔴"
-
 st.markdown(
     f"<div class='hero'><h1>🌿 {t('title')}</h1><p>{t('subtitle')}</p></div>",
     unsafe_allow_html=True,
 )
 
-lower_type = event_type.casefold()
-if "primary" in lower_type:
-    status_class, status_line, status_title = "danger", t("active"), f"🚨 {target.replace('_', ' ').upper()} · {confidence_text}"
-elif "background" in lower_type:
-    status_class, status_line, status_title = "warning", t("background"), f"🔎 {target.replace('_', ' ').upper()} · {confidence_text}"
-elif 0 < chunks_received < total_chunks:
-    status_class, status_line, status_title = "receiving", t("receiving"), f"📡 {chunks_received}/{total_chunks}"
-else:
-    status_class, status_line, status_title = "safe", t("secure"), t("monitoring")
+@st.fragment(run_every=refresh_seconds)
+def status_banner() -> None:
+    state = feed_snapshot()
+    lower_type = state["event_type"].casefold()
+    if "primary" in lower_type:
+        status_class, status_line = "danger", t("active")
+        status_title = f"🚨 {state['target'].replace('_', ' ').upper()} · {state['confidence_text']}"
+    elif "background" in lower_type:
+        status_class, status_line = "warning", t("background")
+        status_title = f"🔎 {state['target'].replace('_', ' ').upper()} · {state['confidence_text']}"
+    elif 0 < state["chunks_received"] < state["total_chunks"]:
+        status_class, status_line = "receiving", t("receiving")
+        status_title = f"📡 {state['chunks_received']}/{state['total_chunks']}"
+    else:
+        status_class, status_line, status_title = "safe", t("secure"), t("monitoring")
+    st.markdown(
+        f"<div class='status {status_class}'><p>{status_line}</p><h2>{status_title}</h2></div>",
+        unsafe_allow_html=True,
+    )
 
-st.markdown(
-    f"<div class='status {status_class}'><p>{status_line}</p><h2>{status_title}</h2></div>",
-    unsafe_allow_html=True,
-)
+
+status_banner()
 
 tab_live, tab_events, tab_guide, tab_system = st.tabs([f"📡 {t('live')}", f"📊 {t('events')}", f"🦉 {t('guide')}", f"🧰 {t('system')}"])
 
 with tab_live:
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric(t("packets"), f"{chunks_received} / {total_chunks}")
-    m2.metric(t("progress"), f"{progress:.1%}")
-    m3.metric(t("confidence"), confidence_text)
-    m4.metric(t("last_update"), f"{receiver_icon} {receiver_status}")
-    st.progress(progress)
+    @st.fragment(run_every=refresh_seconds)
+    def live_panel() -> None:
+        state = feed_snapshot()
+        feed_age = state["feed_age"]
+        receiver_status = t("online") if feed_age is not None and feed_age <= 15 else t("delayed") if feed_age is not None and feed_age <= 60 else t("offline")
+        receiver_icon = "🟢" if feed_age is not None and feed_age <= 15 else "🟠" if feed_age is not None and feed_age <= 60 else "🔴"
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric(t("packets"), f"{state['chunks_received']} / {state['total_chunks']}")
+        m2.metric(t("progress"), f"{state['progress']:.1%}")
+        m3.metric(t("confidence"), state["confidence_text"])
+        m4.metric(t("last_update"), f"{receiver_icon} {receiver_status}")
+        st.progress(state["progress"])
 
-    left, right = st.columns([1, 1.15])
-    with left:
-        st.subheader(f"📈 {t('latency')}")
-        if len(packets_df) > 1:
-            st.line_chart(packets_df, x="packet", y="time_elapsed", x_label="Chunk", y_label="Elapsed time (s)")
-        else:
-            st.info(t("no_packets"))
-    with right:
-        st.subheader(f"🖼️ {t('canvas')}")
-        last_archived = str(data.get("last_archived_image", ""))
-        if 0 < chunks_received < total_chunks and image_bytes(LIVE_IMAGE):
-            st.image(image_bytes(LIVE_IMAGE), caption=f"📥 {t('reconstructing')} ({chunks_received}/{total_chunks})", use_container_width=True)
-        elif last_archived and image_bytes(last_archived):
-            st.image(image_bytes(last_archived), caption=f"✅ {t('snapshot')}: {target.replace('_', ' ')}", use_container_width=True)
-        elif image_bytes(LIVE_IMAGE):
-            st.image(image_bytes(LIVE_IMAGE), caption=t("canvas"), use_container_width=True)
-        else:
-            st.info(t("waiting"))
+        left, right = st.columns([1, 1.15])
+        with left:
+            st.subheader(f"📈 {t('latency')}")
+            if len(state["packets"]) > 1:
+                st.line_chart(state["packets"], x="packet", y="time_elapsed", x_label="Chunk", y_label="Elapsed time (s)")
+            else:
+                st.info(t("no_packets"))
+        with right:
+            st.subheader(f"🖼️ {t('canvas')}")
+            live_payload = stable_image(LIVE_IMAGE, "last_valid_live_image")
+            last_archived = str(state["data"].get("last_archived_image", ""))
+            archived_payload = stable_image(last_archived, "last_valid_archived_image") if last_archived else None
+            if 0 < state["chunks_received"] < state["total_chunks"] and live_payload:
+                st.image(live_payload, caption=f"📥 {t('reconstructing')} ({state['chunks_received']}/{state['total_chunks']})", width="stretch")
+            elif archived_payload:
+                st.image(archived_payload, caption=f"✅ {t('snapshot')}: {state['target'].replace('_', ' ')}", width="stretch")
+            elif live_payload:
+                st.image(live_payload, caption=t("canvas"), width="stretch")
+            else:
+                st.info(t("waiting"))
+
+    live_panel()
 
 with tab_events:
+    event_state = feed_snapshot()
+    history_df = event_state["history"]
     e1, e2, e3 = st.columns(3)
     e1.metric(t("event_total"), len(history_df))
     if not history_df.empty:
@@ -522,7 +575,7 @@ with tab_events:
 
                 figure = px.bar(chart_data, x="Events", y="Class", orientation="h", color="Events", color_continuous_scale="Greens")
                 figure.update_layout(height=max(330, len(chart_data) * 30), margin=dict(t=10, b=10, l=10, r=10), coloraxis_showscale=False)
-                st.plotly_chart(figure, use_container_width=True)
+                st.plotly_chart(figure, width="stretch")
             except ImportError:
                 st.bar_chart(chart_data, x="Class", y="Events")
         else:
@@ -533,7 +586,7 @@ with tab_events:
             classes = sorted(history_df["target"].dropna().unique())
             selected = st.multiselect(t("category"), classes, default=classes)
             visible = history_df[history_df["target"].isin(selected)].iloc[::-1]
-            st.dataframe(visible, use_container_width=True, hide_index=True)
+            st.dataframe(visible, width="stretch", hide_index=True)
             st.download_button(t("download"), visible.to_csv(index=False).encode("utf-8"), "green_edge_events.csv", "text/csv")
         else:
             st.info(t("no_history"))
@@ -550,7 +603,7 @@ with tab_events:
             payload = image_bytes(path)
             if payload:
                 with gallery_cols[index % 4]:
-                    st.image(payload, caption=f"🏷️ {label}\n{stamp}", use_container_width=True)
+                    st.image(payload, caption=f"🏷️ {label}\n{stamp}", width="stretch")
     else:
         st.info(t("no_archive"))
 
@@ -586,9 +639,9 @@ with tab_guide:
                 else representative_photo(animal["taxon"])
             ) if local_photo is None else None
             if local_photo:
-                st.image(str(local_photo), caption=t("representative"), use_container_width=True)
+                st.image(str(local_photo), caption=t("representative"), width="stretch")
             elif photo:
-                st.image(photo["url"], caption=t("representative"), use_container_width=True)
+                st.image(photo["url"], caption=t("representative"), width="stretch")
                 st.caption(f"Photo: {photo['attribution']} · {photo['license']} · [iNaturalist]({photo['source']})")
             else:
                 st.info(t("photo_unavailable"))
@@ -596,6 +649,13 @@ with tab_guide:
             st.caption(t("image_note"))
 
 with tab_system:
+    system_state = feed_snapshot()
+    data = system_state["data"]
+    packets_df = system_state["packets"]
+    chunks_received = system_state["chunks_received"]
+    total_chunks = system_state["total_chunks"]
+    feed_age = system_state["feed_age"]
+    event_type = system_state["event_type"]
     rate = None
     eta = None
     if len(packets_df) > 1:
